@@ -1,0 +1,21 @@
+{
+  "name": "multi-post-dash",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@atproto/api": "^0.18.15",
+    "@hono/node-server": "^1.19.9",
+    "dotenv": "^17.2.3",
+    "hono": "^4.11.4",
+    "twitter-api-v2": "^1.29.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.6.0",
+    "tsx": "^4.7.1",
+    "typescript": "^5.9.3"
+  },
+  "type": "module"
+}
