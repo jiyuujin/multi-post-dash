@@ -268,10 +268,14 @@ app.post('/api/post', async (c) => {
   // 1. X (Twitter)
   if (platforms.includes('x')) {
     try {
-      const escape = (s: string) => encodeURIComponent(s).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+      const escape = (s: string) =>
+        encodeURIComponent(s).replace(
+          /[!'()*]/g,
+          (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+        )
 
-      const method = 'POST';
-      const url = 'https://api.twitter.com/2/tweets';
+      const method = 'POST'
+      const url = 'https://api.twitter.com/2/tweets'
       const oauth_params: any = {
         oauth_consumer_key: config.xKey,
         oauth_nonce: Math.random().toString(36).substring(2),
@@ -279,44 +283,60 @@ app.post('/api/post', async (c) => {
         oauth_timestamp: Math.floor(Date.now() / 1000).toString(),
         oauth_token: config.xToken,
         oauth_version: '1.0',
-      };
+      }
 
-      const paramsString = Object.keys(oauth_params).sort().map(k => `${escape(k)}=${escape(oauth_params[k])}`).join('&');
-      const signatureBase = `${method}&${escape(url)}&${escape(paramsString)}`;
-      const signingKey = `${escape(config.xSecret)}&${escape(config.xTokenSecret)}`;
+      const paramsString = Object.keys(oauth_params)
+        .sort()
+        .map((k) => `${escape(k)}=${escape(oauth_params[k])}`)
+        .join('&')
+      const signatureBase = `${method}&${escape(url)}&${escape(paramsString)}`
+      const signingKey = `${escape(config.xSecret)}&${escape(config.xTokenSecret)}`
 
-      const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(signingKey), { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
-      const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(signatureBase));
-      oauth_params.oauth_signature = btoa(String.fromCharCode(...new Uint8Array(signature)));
+      const key = await crypto.subtle.importKey(
+        'raw',
+        new TextEncoder().encode(signingKey),
+        { name: 'HMAC', hash: 'SHA-1' },
+        false,
+        ['sign'],
+      )
+      const signature = await crypto.subtle.sign(
+        'HMAC',
+        key,
+        new TextEncoder().encode(signatureBase),
+      )
+      oauth_params.oauth_signature = btoa(String.fromCharCode(...new Uint8Array(signature)))
 
-      const authHeader = 'OAuth ' + Object.keys(oauth_params).map(k => `${escape(k)}="${escape(oauth_params[k])}"`).join(', ');
+      const authHeader =
+        'OAuth ' +
+        Object.keys(oauth_params)
+          .map((k) => `${escape(k)}="${escape(oauth_params[k])}"`)
+          .join(', ')
 
       const xRes = await fetch(url, {
         method: 'POST',
         headers: {
-          'Authorization': authHeader,
+          Authorization: authHeader,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ text: text })
-      });
+        body: JSON.stringify({ text: text }),
+      })
 
       if (xRes.ok) {
-        results.x = 'success';
+        results.x = 'success'
       } else {
-        const err = await xRes.json() as any;
-        results.x = `error: ${err.detail || err.title}`;
+        const err = (await xRes.json()) as any
+        results.x = `error: ${err.detail || err.title}`
       }
     } catch (e: any) {
-      results.x = `error: ${e.message}`;
+      results.x = `error: ${e.message}`
     }
   }
 
   // 2. Bluesky
   if (platforms.includes('bsky')) {
     try {
-      const PDS = 'https://bsky.social/xrpc';
+      const PDS = 'https://bsky.social/xrpc'
 
-      // 1. セッション作成 (ログイン)
       const loginRes = await fetch(`${PDS}/com.atproto.server.createSession`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -324,12 +344,11 @@ app.post('/api/post', async (c) => {
           identifier: config.bskyHandle,
           password: config.bskyPass,
         }),
-      });
-      const session = await loginRes.json() as any;
+      })
+      const session = (await loginRes.json()) as any
 
-      if (!loginRes.ok) throw new Error(session.message || 'Login failed');
+      if (!loginRes.ok) throw new Error(session.message || 'Login failed')
 
-      // 2. 投稿作成 (Record 作成)
       const postRes = await fetch(`${PDS}/com.atproto.repo.createRecord`, {
         method: 'POST',
         headers: {
@@ -345,24 +364,23 @@ app.post('/api/post', async (c) => {
             $type: 'app.bsky.feed.post',
           },
         }),
-      });
+      })
 
       if (postRes.ok) {
-        results.bsky = 'success';
+        results.bsky = 'success'
       } else {
-        const err = await postRes.json() as any;
-        results.bsky = `error: ${err.message}`;
+        const err = (await postRes.json()) as any
+        results.bsky = `error: ${err.message}`
       }
     } catch (e: any) {
-      console.error('Bsky Error:', e);
-      results.bsky = `error: ${e.message}`;
+      console.error('Bsky Error:', e)
+      results.bsky = `error: ${e.message}`
     }
   }
 
   // 3. Threads
   if (platforms.includes('threads')) {
     try {
-      // 1. 投稿コンテナを作成
       const containerRes = await fetch(
         `https://graph.threads.net/v1.0/${config.threadsUserId}/threads`,
         {
@@ -382,7 +400,6 @@ app.post('/api/post', async (c) => {
         throw new Error(containerData.error?.message || 'Failed to create container')
       }
 
-      // 2. 作成したコンテナを公開
       const publishRes = await fetch(
         `https://graph.threads.net/v1.0/${config.threadsUserId}/threads_publish`,
         {
@@ -406,7 +423,7 @@ app.post('/api/post', async (c) => {
     }
   }
 
-  // --- 4. Mastodon 投稿処理 ---
+  // 4. Mastodon
   if (platforms.includes('mastodon')) {
     try {
       const instanceUrl = config.mastoInstance.replace(/\/$/, '') // 末尾の / を削除
