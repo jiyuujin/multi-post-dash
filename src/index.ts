@@ -2,8 +2,6 @@ import { Hono } from 'hono'
 import { html } from 'hono/html'
 import { cors } from 'hono/cors'
 import { AtpAgent } from '@atproto/api'
-import { TwitterApi } from 'twitter-api-v2'
-import { serve } from '@hono/node-server'
 
 const app = new Hono()
 
@@ -271,16 +269,46 @@ app.post('/api/post', async (c) => {
   // 1. X (Twitter)
   if (platforms.includes('x')) {
     try {
-      const x = new TwitterApi({
-        appKey: config.xKey,
-        appSecret: config.xSecret,
-        accessToken: config.xToken,
-        accessSecret: config.xTokenSecret,
-      })
-      await x.v2.tweet(text)
-      results.x = 'success'
-    } catch (e) {
-      results.x = 'error'
+      const escape = (s: string) => encodeURIComponent(s).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+
+      const method = 'POST';
+      const url = 'https://api.twitter.com/2/tweets';
+      const oauth_params: any = {
+        oauth_consumer_key: config.xKey,
+        oauth_nonce: Math.random().toString(36).substring(2),
+        oauth_signature_method: 'HMAC-SHA1',
+        oauth_timestamp: Math.floor(Date.now() / 1000).toString(),
+        oauth_token: config.xToken,
+        oauth_version: '1.0',
+      };
+
+      const paramsString = Object.keys(oauth_params).sort().map(k => `${escape(k)}=${escape(oauth_params[k])}`).join('&');
+      const signatureBase = `${method}&${escape(url)}&${escape(paramsString)}`;
+      const signingKey = `${escape(config.xSecret)}&${escape(config.xTokenSecret)}`;
+
+      const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(signingKey), { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
+      const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(signatureBase));
+      oauth_params.oauth_signature = btoa(String.fromCharCode(...new Uint8Array(signature)));
+
+      const authHeader = 'OAuth ' + Object.keys(oauth_params).map(k => `${escape(k)}="${escape(oauth_params[k])}"`).join(', ');
+
+      const xRes = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Authorization': authHeader,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ text: text })
+      });
+
+      if (xRes.ok) {
+        results.x = 'success';
+      } else {
+        const err = await xRes.json() as any;
+        results.x = `error: ${err.detail || err.title}`;
+      }
+    } catch (e: any) {
+      results.x = `error: ${e.message}`;
     }
   }
 
