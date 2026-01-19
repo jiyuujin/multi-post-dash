@@ -1,7 +1,6 @@
 import { Hono } from 'hono'
 import { html } from 'hono/html'
 import { cors } from 'hono/cors'
-import { AtpAgent } from '@atproto/api'
 
 const app = new Hono()
 
@@ -315,16 +314,48 @@ app.post('/api/post', async (c) => {
   // 2. Bluesky
   if (platforms.includes('bsky')) {
     try {
-      const agent = new AtpAgent({ service: 'https://bsky.social' })
-      await agent.login({
-        identifier: config.bskyHandle,
-        password: config.bskyPass,
-      })
-      await agent.login({ identifier: config.bskyHandle, password: config.bskyPass })
-      await agent.post({ text, createdAt: new Date().toISOString() })
-      results.bsky = 'success'
-    } catch (e) {
-      results.bsky = 'error'
+      const PDS = 'https://bsky.social/xrpc';
+
+      // 1. セッション作成 (ログイン)
+      const loginRes = await fetch(`${PDS}/com.atproto.server.createSession`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          identifier: config.bskyHandle,
+          password: config.bskyPass,
+        }),
+      });
+      const session = await loginRes.json() as any;
+
+      if (!loginRes.ok) throw new Error(session.message || 'Login failed');
+
+      // 2. 投稿作成 (Record 作成)
+      const postRes = await fetch(`${PDS}/com.atproto.repo.createRecord`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.accessJwt}`,
+        },
+        body: JSON.stringify({
+          repo: session.did,
+          collection: 'app.bsky.feed.post',
+          record: {
+            text: text,
+            createdAt: new Date().toISOString(),
+            $type: 'app.bsky.feed.post',
+          },
+        }),
+      });
+
+      if (postRes.ok) {
+        results.bsky = 'success';
+      } else {
+        const err = await postRes.json() as any;
+        results.bsky = `error: ${err.message}`;
+      }
+    } catch (e: any) {
+      console.error('Bsky Error:', e);
+      results.bsky = `error: ${e.message}`;
     }
   }
 
