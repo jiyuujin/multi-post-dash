@@ -181,7 +181,7 @@ app.get('/', (c) => {
         </div>
 
         <script>
-          let platforms = ['x', 'bsky', 'threads']
+          let platforms = ['x', 'bsky', 'threads', 'mastodon']
           const limits = { x: 140, bsky: 300, threads: 500, mastodon: 500 }
 
           function togglePlatform(p) {
