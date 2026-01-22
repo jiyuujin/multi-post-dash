@@ -1,8 +1,13 @@
+import type { ExecutionContext, KVNamespace, ScheduledEvent } from '@cloudflare/workers-types'
 import { Hono } from 'hono'
 import { html } from 'hono/html'
 import { cors } from 'hono/cors'
 
-const app = new Hono()
+type Bindings = {
+  POST_QUEUE: KVNamespace
+}
+
+const app = new Hono<{ Bindings: Bindings }>()
 
 app.use('/*', cors())
 
@@ -171,13 +176,55 @@ app.get('/', (c) => {
             </div>
           </div>
 
-          <button
-            id="postBtn"
-            onclick="sendPost()"
-            class="w-full bg-blue-600 hover:bg-blue-700 text-white py-5 rounded-[1.5rem] font-extrabold text-xl shadow-xl shadow-blue-200 transition-all disabled:opacity-30 disabled:shadow-none"
-          >
-            投稿を配信する
-          </button>
+          <div class="mb-6 p-4 bg-slate-50 rounded-2xl border border-slate-100">
+            <label class="block text-[10px] font-bold uppercase text-slate-400 mb-2 px-2"
+              >配信予約（オプション）</label
+            >
+            <input
+              type="datetime-local"
+              id="scheduledAt"
+              class="w-full bg-transparent text-slate-700 font-semibold focus:outline-none px-2 cursor-pointer"
+            />
+          </div>
+
+          <div class="grid grid-cols-2 gap-3">
+            <button
+              id="postBtn"
+              onclick="sendPost(false)"
+              class="bg-blue-600 hover:bg-blue-700 text-white py-4 rounded-2xl font-bold text-sm shadow-lg shadow-blue-200 transition-all disabled:opacity-30"
+            >
+              今すぐ投稿
+            </button>
+            <button
+              id="scheduleBtn"
+              onclick="sendPost(true)"
+              class="bg-slate-800 hover:bg-slate-900 text-white py-4 rounded-2xl font-bold text-sm shadow-lg shadow-slate-200 transition-all disabled:opacity-30"
+            >
+              予約する
+            </button>
+          </div>
+
+          <div class="mt-10">
+            <div class="flex justify-between items-center mb-4 px-2">
+              <h3 class="text-sm font-extrabold text-slate-500 uppercase tracking-widest">
+                予約済みの投稿
+              </h3>
+              <button
+                onclick="fetchQueue()"
+                class="text-xs text-blue-600 font-bold hover:underline"
+              >
+                更新 ↻
+              </button>
+            </div>
+
+            <div id="queueList" class="space-y-3">
+              <p
+                class="text-center py-8 text-slate-400 text-sm italic bg-slate-50/50 rounded-3xl border-2 border-dashed border-slate-100"
+              >
+                予約された投稿はありません
+              </p>
+            </div>
+          </div>
         </div>
 
         <script>
@@ -229,30 +276,125 @@ app.get('/', (c) => {
             toggleSettings()
           }
 
-          async function sendPost() {
+          async function sendPost(isSchedule) {
             const text = document.getElementById('mainText').value
+            const scheduledAt = document.getElementById('scheduledAt').value
             const config = JSON.parse(localStorage.getItem('post_dash_v3'))
-            const btn = document.getElementById('postBtn')
+
+            if (isSchedule && !scheduledAt) {
+              alert('予約日時を選択してください')
+              return
+            }
+
+            const btn = isSchedule
+              ? document.getElementById('scheduleBtn')
+              : document.getElementById('postBtn')
+            const originalText = btn.innerText
 
             btn.disabled = true
-            btn.innerText = '配信中...'
+            btn.innerText = isSchedule ? '予約中...' : '配信中...'
 
             try {
-              const res = await fetch('/api/post', {
+              const endpoint = isSchedule ? '/api/schedule' : '/api/post'
+
+              const res = await fetch(endpoint, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text, platforms, config }),
+                body: JSON.stringify({
+                  text,
+                  platforms,
+                  config,
+                  scheduledAt: isSchedule ? scheduledAt : null, // 予約日時を送信
+                }),
               })
-              const result = await res.json()
-              alert('配信完了！')
-              document.getElementById('mainText').value = ''
-              updateUI()
+
+              if (res.ok) {
+                alert(isSchedule ? '予約が完了しました！' : '配信完了！')
+                document.getElementById('mainText').value = ''
+                document.getElementById('scheduledAt').value = ''
+                updateUI()
+              } else {
+                alert('エラーが発生しました')
+              }
             } catch (e) {
               alert('Error: ' + e)
             } finally {
               btn.disabled = false
-              btn.innerText = '投稿を配信する'
+              btn.innerText = originalText
             }
+          }
+
+          async function fetchQueue() {
+            var container = document.getElementById('queueList')
+
+            try {
+              var res = await fetch('/api/queue')
+              var data = await res.json()
+
+              if (!data || data.length === 0) {
+                container.innerHTML =
+                  '<p class="text-center py-8 text-slate-400 text-sm italic bg-slate-50/50 rounded-3xl border-2 border-dashed border-slate-100">予約された投稿はありません</p>'
+                return
+              }
+
+              var htmlContent = ''
+              for (var i = 0; i < data.length; i++) {
+                var item = data[i]
+
+                var badges = ''
+                for (var j = 0; j < item.platforms.length; j++) {
+                  badges +=
+                    '<span class="text-[10px] bg-slate-200 px-1.5 py-0.5 rounded uppercase font-bold text-slate-600 mr-1">' +
+                    item.platforms[j] +
+                    '</span>'
+                }
+
+                var dateStr = new Date(item.scheduledAt).toLocaleString('ja-JP', {
+                  month: 'short',
+                  day: 'numeric',
+                  hour: '2-digit',
+                  minute: '2-digit',
+                })
+
+                htmlContent +=
+                  '<div class="glass bg-white/50 p-4 rounded-2xl border border-slate-100 shadow-sm mb-3">' +
+                  '<div class="flex justify-between items-start mb-2">' +
+                  '<div class="flex gap-1">' +
+                  badges +
+                  '</div>' +
+                  '<span class="text-[10px] font-mono font-bold text-blue-500 bg-blue-50 px-2 py-0.5 rounded-full">' +
+                  dateStr +
+                  '</span>' +
+                  '</div>' +
+                  '<p class="text-sm text-slate-600 line-clamp-2 mb-3 px-1">' +
+                  item.text +
+                  '</p>' +
+                  '<button onclick="deletePost(\\' + item.id + \\')" class="w-full py-1.5 text-[10px] font-bold text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors border border-red-50">' +
+                  '予約を取り消す' +
+                  '</button>' +
+                  '</div>'
+              }
+              container.innerHTML = htmlContent
+            } catch (e) {
+              console.error('Queue fetch error:', e)
+              container.innerHTML =
+                '<p class="text-center py-4 text-red-400 text-xs">読み込みに失敗しました</p>'
+            }
+          }
+
+          async function deletePost(id) {
+            if (!confirm('この予約を削除しますか？')) return
+
+            try {
+              await fetch(\`/api/queue/\${id}\`, { method: 'DELETE' })
+              fetchQueue() // リストを再読み込み
+            } catch (e) {
+              alert('削除に失敗しました')
+            }
+          }
+
+          window.onload = () => {
+            fetchQueue()
           }
         </script>
       </body>
@@ -261,8 +403,10 @@ app.get('/', (c) => {
 })
 
 // --- バックエンド: API ロジック ---
-app.post('/api/post', async (c) => {
-  const { text, platforms, config } = await c.req.json()
+// app.post('/api/post', async (c) => {
+async function executePost(data: any) {
+  // const { text, platforms, config } = await c.req.json()
+  const { text, platforms, config } = data
   const results: any = {}
 
   // 1. X (Twitter)
@@ -447,7 +591,47 @@ app.post('/api/post', async (c) => {
     }
   }
 
+  //   return c.json(results)
+  return results
+  // })
+}
+
+app.post('/api/post', async (c) => {
+  const data = await c.req.json()
+  const results = await executePost(data)
   return c.json(results)
+})
+
+app.post('/api/schedule', async (c) => {
+  const { text, platforms, config, scheduledAt } = await c.req.json()
+  const id = crypto.randomUUID()
+  const payload = { id, text, platforms, config, scheduledAt: new Date(scheduledAt).getTime() }
+  await c.env.POST_QUEUE.put(`queue:${payload.scheduledAt}:${id}`, JSON.stringify(payload))
+  return c.json({ success: true })
+})
+
+app.get('/api/queue', async (c) => {
+  const list = await c.env.POST_QUEUE.list({ prefix: 'queue:' })
+  const items = await Promise.all(
+    list.keys.map(async (k: { name: string }) =>
+      JSON.parse((await c.env.POST_QUEUE.get(k.name)) || 'null'),
+    ),
+  )
+  return c.json(
+    items
+      .filter((i: unknown) => i)
+      .sort(
+        (a: { scheduledAt: number }, b: { scheduledAt: number }) => a.scheduledAt - b.scheduledAt,
+      ),
+  )
+})
+
+app.delete('/api/queue/:id', async (c) => {
+  const id = c.req.param('id')
+  const list = await c.env.POST_QUEUE.list({ prefix: 'queue:' })
+  const target = list.keys.find((k: { name: string }) => k.name.endsWith(id))
+  if (target) await c.env.POST_QUEUE.delete(target.name)
+  return c.json({ success: !!target })
 })
 
 // serve({
@@ -455,4 +639,20 @@ app.post('/api/post', async (c) => {
 //   port: 3000,
 // })
 
-export default app
+export default {
+  fetch: app.fetch,
+  async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
+    const now = Date.now()
+    const list = await env.POST_QUEUE.list({ prefix: 'queue:' })
+    for (const key of list.keys) {
+      const timestamp = parseInt(key.name.split(':')[1])
+      if (timestamp <= now) {
+        const val = await env.POST_QUEUE.get(key.name)
+        if (val) {
+          await executePost(JSON.parse(val))
+          await env.POST_QUEUE.delete(key.name)
+        }
+      }
+    }
+  },
+}

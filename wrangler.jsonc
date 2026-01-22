@@ -6,4 +6,11 @@
   "observability": {
     "enabled": true,
   },
+  "kv_namespaces": [
+    {
+      "binding": "POST_QUEUE",
+      "id": "0d7cb598e3f84efa87cbee98744c8b2a",
+      "remote": true,
+    },
+  ],
 }
