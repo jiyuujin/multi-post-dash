@@ -5,13 +5,97 @@ import { cors } from 'hono/cors'
 
 type Bindings = {
   POST_QUEUE: KVNamespace
+  MULTI_POST_DASH_USER_CONFIGS: KVNamespace
+  CF_TEAM_DOMAIN: string
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
 
 app.use('/*', cors())
 
-// --- フロントエンド: HTML / CSS / JavaScript ---
+interface CfAccessPayload {
+  email: string
+  sub: string
+  aud: string | string[]
+  iat: number
+  exp: number
+}
+
+async function verifyCfAccessJwt(
+  request: Request,
+  teamDomain: string,
+): Promise<CfAccessPayload | null> {
+  const token =
+    request.headers.get('Cf-Access-Jwt-Assertion') ?? request.headers.get('cf-access-jwt-assertion')
+
+  if (!token) return null
+
+  const parts = token.split('.')
+  if (parts.length !== 3) return null
+
+  const [headerB64, payloadB64, signatureB64] = parts
+
+  let payload: CfAccessPayload
+  try {
+    payload = JSON.parse(atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/')))
+  } catch {
+    return null
+  }
+
+  if (payload.exp < Math.floor(Date.now() / 1000)) return null
+
+  const certsUrl = `https://${teamDomain}.cloudflareaccess.com/cdn-cgi/access/certs`
+  let jwks: { keys: JsonWebKey[] }
+  try {
+    const res = await fetch(certsUrl)
+    jwks = (await res.json()) as { keys: JsonWebKey[] }
+  } catch {
+    return null
+  }
+
+  let kid: string | undefined
+  try {
+    const header = JSON.parse(atob(headerB64.replace(/-/g, '+').replace(/_/g, '/')))
+    kid = header.kid
+  } catch {
+    return null
+  }
+
+  const jwk = kid ? jwks.keys.find((k: any) => k.kid === kid) : jwks.keys[0]
+  if (!jwk) return null
+
+  try {
+    const key = await crypto.subtle.importKey(
+      'jwk',
+      jwk,
+      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+      false,
+      ['verify'],
+    )
+    const encoder = new TextEncoder()
+    const data = encoder.encode(`${headerB64}.${payloadB64}`)
+    const signature = Uint8Array.from(
+      atob(signatureB64.replace(/-/g, '+').replace(/_/g, '/')),
+      (c) => c.charCodeAt(0),
+    )
+    const valid = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, signature, data)
+    if (!valid) return null
+  } catch {
+    return null
+  }
+
+  return payload
+}
+
+async function getUser(
+  request: Request,
+  teamDomain: string,
+): Promise<{ email: string; sub: string } | null> {
+  const payload = await verifyCfAccessJwt(request, teamDomain)
+  if (!payload) return null
+  return { email: payload.email, sub: payload.sub }
+}
+
 app.get('/', (c) => {
   return c.html(html`
     <!DOCTYPE html>
@@ -37,18 +121,81 @@ app.get('/', (c) => {
         <div class="max-w-lg w-full glass rounded-[2.5rem] shadow-2xl p-8 border border-white">
           <header class="flex justify-between items-center mb-8">
             <h1 class="text-2xl font-extrabold tracking-tight text-slate-900">Post Dash</h1>
-            <button
-              onclick="toggleSettings()"
-              class="text-slate-400 hover:text-slate-600 transition-colors"
-            >
-              ⚙️
-            </button>
+            <div class="flex items-center gap-3">
+              <div id="userBadge" class="hidden items-center gap-2">
+                <span
+                  id="userEmail"
+                  class="text-xs font-bold text-slate-500 bg-slate-100 px-2 py-1 rounded-full"
+                ></span>
+                <span
+                  class="text-[10px] text-green-500 font-bold bg-green-50 px-2 py-1 rounded-full"
+                  >✓ Workspace</span
+                >
+              </div>
+              <button
+                onclick="toggleSettings()"
+                class="text-slate-400 hover:text-slate-600 transition-colors"
+              >
+                ⚙️
+              </button>
+            </div>
           </header>
 
           <div
             id="settings"
             class="hidden space-y-4 mb-6 p-6 bg-slate-50 rounded-3xl border border-slate-200 text-sm"
           >
+            <div
+              id="workspaceNotice"
+              class="hidden p-3 bg-blue-50 border border-blue-200 rounded-2xl text-blue-700 text-xs font-semibold"
+            >
+              🏢 Google Workspace
+              アカウントで認証中です。設定を保存するとサーバー側にも自動保存されます。
+            </div>
+
+            <!-- デフォルトプラットフォーム選択 -->
+            <div class="pb-4 border-b border-slate-200">
+              <h3 class="font-bold mb-3 text-slate-700">デフォルトで投稿するプラットフォーム</h3>
+              <div class="grid grid-cols-2 gap-2">
+                <label
+                  class="flex items-center gap-2 cursor-pointer p-2 rounded-xl hover:bg-slate-100"
+                >
+                  <input type="checkbox" id="default-x" class="w-4 h-4 rounded accent-slate-900" />
+                  <span class="font-semibold text-slate-600">𝕏 X</span>
+                </label>
+                <label
+                  class="flex items-center gap-2 cursor-pointer p-2 rounded-xl hover:bg-slate-100"
+                >
+                  <input
+                    type="checkbox"
+                    id="default-bsky"
+                    class="w-4 h-4 rounded accent-blue-500"
+                  />
+                  <span class="font-semibold text-slate-600">🦋 Bluesky</span>
+                </label>
+                <label
+                  class="flex items-center gap-2 cursor-pointer p-2 rounded-xl hover:bg-slate-100"
+                >
+                  <input
+                    type="checkbox"
+                    id="default-threads"
+                    class="w-4 h-4 rounded accent-purple-500"
+                  />
+                  <span class="font-semibold text-slate-600">🧵 Threads</span>
+                </label>
+                <label
+                  class="flex items-center gap-2 cursor-pointer p-2 rounded-xl hover:bg-slate-100"
+                >
+                  <input
+                    type="checkbox"
+                    id="default-mastodon"
+                    class="w-4 h-4 rounded accent-orange-400"
+                  />
+                  <span class="font-semibold text-slate-600">🐘 Mastodon</span>
+                </label>
+              </div>
+            </div>
+
             <h3 class="font-bold border-b pb-2 mb-2 text-slate-700">API Credentials</h3>
             <div class="space-y-2">
               <p class="font-semibold text-slate-500">𝕏 (Twitter)</p>
@@ -126,7 +273,7 @@ app.get('/', (c) => {
               onclick="saveSettings()"
               class="w-full bg-slate-900 text-white p-3 rounded-xl font-bold mt-4"
             >
-              設定をブラウザに保存
+              設定を保存
             </button>
           </div>
 
@@ -134,28 +281,28 @@ app.get('/', (c) => {
             <button
               onclick="togglePlatform('x')"
               id="card-x"
-              class="platform-card active border-2 border-slate-900 bg-slate-50 p-3 rounded-2xl flex flex-col items-center"
+              class="platform-card border-2 border-transparent bg-slate-100 p-3 rounded-2xl flex flex-col items-center text-slate-400 opacity-50"
             >
               <span class="text-xl">𝕏</span><span class="text-[10px] font-bold">X</span>
             </button>
             <button
               onclick="togglePlatform('bsky')"
               id="card-bsky"
-              class="platform-card active border-2 border-blue-500 bg-blue-50 p-3 rounded-2xl flex flex-col items-center"
+              class="platform-card border-2 border-transparent bg-slate-100 p-3 rounded-2xl flex flex-col items-center text-slate-400 opacity-50"
             >
               <span class="text-xl">🦋</span><span class="text-[10px] font-bold">Bluesky</span>
             </button>
             <button
               onclick="togglePlatform('threads')"
               id="card-threads"
-              class="platform-card active border-2 border-purple-500 bg-purple-50 p-3 rounded-2xl flex flex-col items-center"
+              class="platform-card border-2 border-transparent bg-slate-100 p-3 rounded-2xl flex flex-col items-center text-slate-400 opacity-50"
             >
               <span class="text-xl">🧵</span><span class="text-[10px] font-bold">Threads</span>
             </button>
             <button
               onclick="togglePlatform('mastodon')"
               id="card-mastodon"
-              class="platform-card active border-2 border-orange-400 bg-orange-50 p-2 rounded-2xl flex flex-col items-center"
+              class="platform-card border-2 border-transparent bg-slate-100 p-2 rounded-2xl flex flex-col items-center text-slate-400 opacity-50"
             >
               <span class="text-xl">🐘</span><span class="font-bold">Mastodon</span>
             </button>
@@ -172,7 +319,7 @@ app.get('/', (c) => {
               id="counter"
               class="absolute bottom-5 right-6 text-xs font-mono font-bold text-slate-400"
             >
-              0 / 140
+              0 / 500
             </div>
           </div>
 
@@ -180,11 +327,19 @@ app.get('/', (c) => {
             <label class="block text-[10px] font-bold uppercase text-slate-400 mb-2 px-2"
               >配信予約（オプション）</label
             >
-            <input
-              type="datetime-local"
-              id="scheduledAt"
-              class="w-full bg-transparent text-slate-700 font-semibold focus:outline-none px-2 cursor-pointer"
-            />
+            <div class="flex gap-2 px-2">
+              <input
+                type="date"
+                id="scheduleDate"
+                class="flex-1 bg-white border border-slate-200 rounded-xl px-3 py-2 text-slate-700 font-semibold focus:outline-none focus:ring-2 focus:ring-blue-100 cursor-pointer text-sm"
+              />
+              <select
+                id="scheduleTime"
+                class="bg-white border border-slate-200 rounded-xl px-3 py-2 text-slate-700 font-semibold focus:outline-none focus:ring-2 focus:ring-blue-100 cursor-pointer text-sm"
+              >
+                <option value="">--:--</option>
+              </select>
+            </div>
           </div>
 
           <div class="grid grid-cols-2 gap-3">
@@ -195,13 +350,21 @@ app.get('/', (c) => {
             >
               今すぐ投稿
             </button>
-            <button
-              id="scheduleBtn"
-              onclick="sendPost(true)"
-              class="bg-slate-800 hover:bg-slate-900 text-white py-4 rounded-2xl font-bold text-sm shadow-lg shadow-slate-200 transition-all disabled:opacity-30"
-            >
-              予約する
-            </button>
+            <div class="relative group">
+              <button
+                id="scheduleBtn"
+                onclick="sendPost(true)"
+                class="w-full bg-slate-800 hover:bg-slate-900 text-white py-4 rounded-2xl font-bold text-sm shadow-lg shadow-slate-200 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                予約する
+              </button>
+              <div
+                id="scheduleBtnTooltip"
+                class="hidden absolute bottom-full mb-2 left-1/2 -translate-x-1/2 w-48 text-center text-[10px] bg-slate-800 text-white px-3 py-2 rounded-xl shadow-lg pointer-events-none"
+              >
+                予約投稿は Workspace ログイン時のみ利用できます
+              </div>
+            </div>
           </div>
 
           <div class="mt-10">
@@ -228,37 +391,247 @@ app.get('/', (c) => {
         </div>
 
         <script>
-          let platforms = ['x', 'bsky', 'threads', 'mastodon']
+          // デフォルトは全て OFF
+          let platforms = []
           const limits = { x: 140, bsky: 300, threads: 500, mastodon: 500 }
+          const platformColors = {
+            x: 'slate-900',
+            bsky: 'blue-500',
+            threads: 'purple-500',
+            mastodon: 'orange-400',
+          }
+          const platformBgs = {
+            x: 'slate-50',
+            bsky: 'blue-50',
+            threads: 'purple-50',
+            mastodon: 'orange-50',
+          }
+          let currentUser = null
+
+          window.onload = async () => {
+            await checkLogin()
+            updateScheduleBtn()
+            fetchQueue()
+          }
+
+          async function checkLogin() {
+            try {
+              const res = await fetch('/api/me')
+              if (!res.ok) {
+                loadDefaultsFromLocalStorage()
+                return
+              }
+              const data = await res.json()
+              if (data.email) {
+                currentUser = data
+                showUserBadge(data.email)
+                await loadUserConfig()
+              }
+            } catch (e) {
+              loadDefaultsFromLocalStorage()
+            }
+          }
+
+          function loadDefaultsFromLocalStorage() {
+            const saved = JSON.parse(localStorage.getItem('post_dash_v3') || '{}')
+            const defaultPlatforms = saved.defaultPlatforms ?? []
+            applyPlatformDefaults(defaultPlatforms)
+          }
+
+          function applyPlatformDefaults(defaultPlatforms) {
+            platforms = []
+            ;['x', 'bsky', 'threads', 'mastodon'].forEach((p) => setCardOff(p))
+
+            defaultPlatforms.forEach((p) => {
+              platforms.push(p)
+              setCardOn(p)
+            })
+            ;['x', 'bsky', 'threads', 'mastodon'].forEach((p) => {
+              const cb = document.getElementById('default-' + p)
+              if (cb) cb.checked = defaultPlatforms.includes(p)
+            })
+
+            updateUI()
+          }
+
+          function setCardOn(p) {
+            const el = document.getElementById('card-' + p)
+            if (el)
+              el.className = \`platform-card border-2 border-\${platformColors[p]} bg-\${platformBgs[p]} p-3 rounded-2xl flex flex-col items-center\`
+          }
+
+          function setCardOff(p) {
+            const el = document.getElementById('card-' + p)
+            if (el)
+              el.className =
+                'platform-card border-2 border-transparent bg-slate-100 p-3 rounded-2xl flex flex-col items-center text-slate-400 opacity-50'
+          }
+
+          function updateScheduleBtn() {
+            const btn = document.getElementById('scheduleBtn')
+            const tooltip = document.getElementById('scheduleBtnTooltip')
+            if (!currentUser) {
+              btn.disabled = true
+              btn.parentElement.addEventListener('mouseenter', () =>
+                tooltip.classList.remove('hidden'),
+              )
+              btn.parentElement.addEventListener('mouseleave', () =>
+                tooltip.classList.add('hidden'),
+              )
+            } else {
+              btn.disabled = false
+            }
+          }
+
+          function showUserBadge(email) {
+            document.getElementById('userBadge').classList.remove('hidden')
+            document.getElementById('userBadge').classList.add('flex')
+            document.getElementById('userEmail').innerText = email
+            document.getElementById('workspaceNotice').classList.remove('hidden')
+          }
+
+          async function loadUserConfig() {
+            try {
+              const res = await fetch('/api/user-config')
+              if (!res.ok) {
+                loadDefaultsFromLocalStorage()
+                return
+              }
+              const config = await res.json()
+              if (!config) {
+                loadDefaultsFromLocalStorage()
+                return
+              }
+
+              const fields = [
+                'xKey',
+                'xSecret',
+                'xToken',
+                'xTokenSecret',
+                'bskyHandle',
+                'bskyPass',
+                'threadsUserId',
+                'threadsToken',
+                'mastoInstance',
+                'mastoToken',
+              ]
+              fields.forEach((f) => {
+                const el = document.getElementById(f)
+                if (el && config[f]) el.value = config[f]
+              })
+
+              const defaultPlatforms =
+                config.defaultPlatforms ??
+                JSON.parse(localStorage.getItem('post_dash_v3') || '{}').defaultPlatforms ??
+                []
+              applyPlatformDefaults(defaultPlatforms)
+            } catch (e) {
+              console.error('Config load error:', e)
+              loadDefaultsFromLocalStorage()
+            }
+          }
+
+          async function saveSettings() {
+            const defaultPlatforms = ['x', 'bsky', 'threads', 'mastodon'].filter(
+              (p) => document.getElementById('default-' + p).checked,
+            )
+
+            const config = {
+              xKey: document.getElementById('xKey').value,
+              xSecret: document.getElementById('xSecret').value,
+              xToken: document.getElementById('xToken').value,
+              xTokenSecret: document.getElementById('xTokenSecret').value,
+              bskyHandle: document.getElementById('bskyHandle').value,
+              bskyPass: document.getElementById('bskyPass').value,
+              threadsUserId: document.getElementById('threadsUserId').value,
+              threadsToken: document.getElementById('threadsToken').value,
+              mastoInstance: document.getElementById('mastoInstance').value,
+              mastoToken: document.getElementById('mastoToken').value,
+              defaultPlatforms,
+            }
+
+            localStorage.setItem('post_dash_v3', JSON.stringify(config))
+
+            applyPlatformDefaults(defaultPlatforms)
+
+            if (currentUser) {
+              try {
+                const res = await fetch('/api/user-config', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(config),
+                })
+                alert(
+                  res.ok
+                    ? 'Workspace アカウントに保存しました！'
+                    : 'LocalStorage に保存しました（サーバー保存に失敗）',
+                )
+              } catch (e) {
+                alert('LocalStorage に保存しました（サーバー保存に失敗）')
+              }
+            } else {
+              alert('Saved! (LocalStorage)')
+            }
+
+            toggleSettings()
+          }
 
           function togglePlatform(p) {
             const el = document.getElementById('card-' + p)
             if (platforms.includes(p)) {
               platforms = platforms.filter((i) => i !== p)
-              el.className =
-                'platform-card border-2 border-transparent bg-slate-100 p-3 rounded-2xl flex flex-col items-center text-slate-400 opacity-50'
+              setCardOff(p)
             } else {
               platforms.push(p)
-              const colors = { x: 'slate-900', bsky: 'blue-500', threads: 'purple-500' }
-              const bgs = { x: 'slate-50', bsky: 'blue-50', threads: 'purple-50' }
-              el.className = \`platform-card border-2 border-\${colors[p]} bg-\${bgs[p]} p-3 rounded-2xl flex flex-col items-center\`
+              setCardOn(p)
             }
             updateUI()
           }
 
           function updateUI() {
             const text = document.getElementById('mainText').value
-            const minLimit = Math.min(...platforms.map((p) => limits[p]))
+            const activeLimits = platforms.length > 0 ? platforms.map((p) => limits[p]) : [500]
+            const minLimit = Math.min(...activeLimits)
             document.getElementById('counter').innerText = \`\${text.length} / \${minLimit}\`
             document.getElementById('postBtn').disabled =
-              text.length === 0 || text.length > minLimit
+              text.length === 0 || text.length > minLimit || platforms.length === 0
           }
 
           function toggleSettings() {
-            document.getElementById('settings').classList.toggle('hidden')
+            const panel = document.getElementById('settings')
+            panel.classList.toggle('hidden')
+            if (!panel.classList.contains('hidden')) {
+              ;['x', 'bsky', 'threads', 'mastodon'].forEach((p) => {
+                const cb = document.getElementById('default-' + p)
+              })
+            }
           }
 
-          function saveSettings() {
+          function buildTimeOptions() {
+            const sel = document.getElementById('scheduleTime')
+            for (let h = 0; h < 24; h++) {
+              for (let m of [0, 30]) {
+                const hh = String(h).padStart(2, '0')
+                const mm = String(m).padStart(2, '0')
+                const opt = document.createElement('option')
+                opt.value = \`\${hh}:\${mm}\`
+                opt.textContent = \`\${hh}:\${mm}\`
+                sel.appendChild(opt)
+              }
+            }
+          }
+          buildTimeOptions()
+
+          async function sendPost(isSchedule) {
+            const text = document.getElementById('mainText').value
+            const scheduleDate = document.getElementById('scheduleDate').value
+            const scheduleTime = document.getElementById('scheduleTime').value
+
+            let scheduledAtValue = null
+            if (scheduleDate && scheduleTime) {
+              scheduledAtValue = \`\${scheduleDate}T\${scheduleTime}\`
+            }
+
             const config = {
               xKey: document.getElementById('xKey').value,
               xSecret: document.getElementById('xSecret').value,
@@ -271,32 +644,32 @@ app.get('/', (c) => {
               mastoInstance: document.getElementById('mastoInstance').value,
               mastoToken: document.getElementById('mastoToken').value,
             }
-            localStorage.setItem('post_dash_v3', JSON.stringify(config))
-            alert('Saved!')
-            toggleSettings()
-          }
 
-          async function sendPost(isSchedule) {
-            const text = document.getElementById('mainText').value
-            const scheduledAt = document.getElementById('scheduledAt').value
-            const config = JSON.parse(localStorage.getItem('post_dash_v3'))
-
-            if (isSchedule && !scheduledAt) {
-              alert('予約日時を選択してください')
-              return
+            if (isSchedule) {
+              if (!scheduleDate || !scheduleTime) {
+                alert('予約日時を選択してください')
+                return
+              }
+              const dateCheck = new Date(scheduledAtValue)
+              if (isNaN(dateCheck.getTime())) {
+                alert('予約日時の形式が正しくありません')
+                return
+              }
+              if (dateCheck <= new Date()) {
+                alert('予約日時は現在より未来を選択してください')
+                return
+              }
             }
 
             const btn = isSchedule
               ? document.getElementById('scheduleBtn')
               : document.getElementById('postBtn')
             const originalText = btn.innerText
-
             btn.disabled = true
             btn.innerText = isSchedule ? '予約中...' : '配信中...'
 
             try {
               const endpoint = isSchedule ? '/api/schedule' : '/api/post'
-
               const res = await fetch(endpoint, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -304,15 +677,18 @@ app.get('/', (c) => {
                   text,
                   platforms,
                   config,
-                  scheduledAt: isSchedule ? scheduledAt : null, // 予約日時を送信
+                  scheduledAt: isSchedule
+                    ? new Date(new Date(scheduledAtValue).getTime() - 5 * 60 * 1000).toISOString()
+                    : null,
                 }),
               })
-
               if (res.ok) {
                 alert(isSchedule ? '予約が完了しました！' : '配信完了！')
                 document.getElementById('mainText').value = ''
-                document.getElementById('scheduledAt').value = ''
+                document.getElementById('scheduleDate').value = ''
+                document.getElementById('scheduleTime').value = ''
                 updateUI()
+                fetchQueue()
               } else {
                 alert('エラーが発生しました')
               }
@@ -358,20 +734,18 @@ app.get('/', (c) => {
 
                 htmlContent +=
                   '<div class="glass bg-white/50 p-4 rounded-2xl border border-slate-100 shadow-sm mb-3">' +
-                  '<div class="flex justify-between items-start mb-2">' +
-                  '<div class="flex gap-1">' +
+                  '<div class="flex justify-between items-start mb-2"><div class="flex gap-1">' +
                   badges +
                   '</div>' +
                   '<span class="text-[10px] font-mono font-bold text-blue-500 bg-blue-50 px-2 py-0.5 rounded-full">' +
                   dateStr +
-                  '</span>' +
-                  '</div>' +
+                  '</span></div>' +
                   '<p class="text-sm text-slate-600 line-clamp-2 mb-3 px-1">' +
                   item.text +
                   '</p>' +
-                  '<button onclick="deletePost(\\' + item.id + \\')" class="w-full py-1.5 text-[10px] font-bold text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors border border-red-50">' +
-                  '予約を取り消す' +
-                  '</button>' +
+                  '<button onclick="deletePost(\\'' +
+                  item.id +
+                  '\\')" class="w-full py-1.5 text-[10px] font-bold text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors border border-red-50">予約を取り消す</button>' +
                   '</div>'
               }
               container.innerHTML = htmlContent
@@ -392,18 +766,34 @@ app.get('/', (c) => {
               alert('削除に失敗しました')
             }
           }
-
-          window.onload = () => {
-            fetchQueue()
-          }
         </script>
       </body>
     </html>
   `)
 })
 
-// --- バックエンド: API ロジック ---
-// app.post('/api/post', async (c) => {
+app.get('/api/me', async (c) => {
+  const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
+  if (!user) return c.json({ error: 'Not authenticated via Cloudflare Access' }, 401)
+  return c.json({ email: user.email, sub: user.sub })
+})
+
+app.get('/api/user-config', async (c) => {
+  const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
+  if (!user) return c.json({ error: 'Unauthorized' }, 401)
+  const raw = await c.env.MULTI_POST_DASH_USER_CONFIGS.get(`user:${user.sub}:config`)
+  if (!raw) return c.json(null)
+  return c.json(JSON.parse(raw))
+})
+
+app.post('/api/user-config', async (c) => {
+  const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
+  if (!user) return c.json({ error: 'Unauthorized' }, 401)
+  const config = await c.req.json()
+  await c.env.MULTI_POST_DASH_USER_CONFIGS.put(`user:${user.sub}:config`, JSON.stringify(config))
+  return c.json({ success: true })
+})
+
 async function executePost(data: any) {
   // const { text, platforms, config } = await c.req.json()
   const { text, platforms, config } = data
@@ -603,15 +993,28 @@ app.post('/api/post', async (c) => {
 })
 
 app.post('/api/schedule', async (c) => {
-  const { text, platforms, config, scheduledAt } = await c.req.json()
+  const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
+  if (!user) return c.json({ error: 'Unauthorized' }, 401)
+  const { text, platforms, scheduledAt } = await c.req.json()
   const id = crypto.randomUUID()
-  const payload = { id, text, platforms, config, scheduledAt: new Date(scheduledAt).getTime() }
-  await c.env.POST_QUEUE.put(`queue:${payload.scheduledAt}:${id}`, JSON.stringify(payload))
+  const payload = {
+    id,
+    text,
+    platforms,
+    userSub: user.sub,
+    scheduledAt: new Date(scheduledAt).getTime(),
+  }
+  await c.env.POST_QUEUE.put(
+    `queue:${user.sub}:${payload.scheduledAt}:${id}`,
+    JSON.stringify(payload),
+  )
   return c.json({ success: true })
 })
 
 app.get('/api/queue', async (c) => {
-  const list = await c.env.POST_QUEUE.list({ prefix: 'queue:' })
+  const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
+  if (!user) return c.json({ error: 'Unauthorized' }, 401)
+  const list = await c.env.POST_QUEUE.list({ prefix: `queue:${user.sub}:` })
   const items = await Promise.all(
     list.keys.map(async (k: { name: string }) =>
       JSON.parse((await c.env.POST_QUEUE.get(k.name)) || 'null'),
@@ -627,8 +1030,10 @@ app.get('/api/queue', async (c) => {
 })
 
 app.delete('/api/queue/:id', async (c) => {
+  const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
+  if (!user) return c.json({ error: 'Unauthorized' }, 401)
   const id = c.req.param('id')
-  const list = await c.env.POST_QUEUE.list({ prefix: 'queue:' })
+  const list = await c.env.POST_QUEUE.list({ prefix: `queue:${user.sub}:` })
   const target = list.keys.find((k: { name: string }) => k.name.endsWith(id))
   if (target) await c.env.POST_QUEUE.delete(target.name)
   return c.json({ success: !!target })
@@ -645,11 +1050,23 @@ export default {
     const now = Date.now()
     const list = await env.POST_QUEUE.list({ prefix: 'queue:' })
     for (const key of list.keys) {
-      const timestamp = parseInt(key.name.split(':')[1])
+      const timestamp = parseInt(key.name.split(':')[2])
       if (timestamp <= now) {
         const val = await env.POST_QUEUE.get(key.name)
         if (val) {
-          await executePost(JSON.parse(val))
+          const payload = JSON.parse(val)
+          const configRaw = await env.MULTI_POST_DASH_USER_CONFIGS.get(
+            `user:${payload.userSub}:config`,
+          )
+          if (!configRaw) {
+            console.error('Config not found')
+            continue
+          }
+          await executePost({
+            text: payload.text,
+            platforms: payload.platforms,
+            config: JSON.parse(configRaw),
+          })
           await env.POST_QUEUE.delete(key.name)
         }
       }

@@ -12,5 +12,16 @@
       "id": "0d7cb598e3f84efa87cbee98744c8b2a",
       "remote": true,
     },
+    {
+      "binding": "MULTI_POST_DASH_USER_CONFIGS",
+      "id": "f9a947a9d11a44f7866f82edae456f1f",
+    },
   ],
+  "vars": {
+    "tz": "Asia/Tokyo",
+    "CF_TEAM_DOMAIN": "nekohack",
+  },
+  "triggers": {
+    "crons": ["0,30 * * * *"],
+  },
 }
