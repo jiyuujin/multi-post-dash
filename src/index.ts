@@ -90,10 +90,27 @@ async function verifyCfAccessJwt(
 async function getUser(
   request: Request,
   teamDomain: string,
-): Promise<{ email: string; sub: string } | null> {
+): Promise<{ email: string; sub: string; domain: string; isGroupMode: boolean } | null> {
   const payload = await verifyCfAccessJwt(request, teamDomain)
   if (!payload) return null
-  return { email: payload.email, sub: payload.sub }
+  const domain = payload.email.split('@')[1] ?? ''
+  const isGroupMode = domain !== 'gmail.com' && domain !== ''
+  return { email: payload.email, sub: payload.sub, domain, isGroupMode }
+}
+
+async function getGroupAdmins(domain: string, env: Bindings): Promise<string[]> {
+  const raw = await env.MULTI_POST_DASH_USER_CONFIGS.get(`group:${domain}:admins`)
+  if (!raw) return []
+  return JSON.parse(raw)
+}
+
+async function isGroupAdmin(email: string, domain: string, env: Bindings): Promise<boolean> {
+  const admins = await getGroupAdmins(domain, env)
+  if (admins.length === 0) {
+    await env.MULTI_POST_DASH_USER_CONFIGS.put(`group:${domain}:admins`, JSON.stringify([email]))
+    return true
+  }
+  return admins.includes(email)
 }
 
 async function generateCodeVerifier(): Promise<string> {
@@ -115,8 +132,16 @@ async function generateCodeChallenge(verifier: string): Promise<string> {
     .replace(/=/g, '')
 }
 
-async function getXOAuth2Token(userSub: string, env: Bindings): Promise<string | null> {
-  const raw = await env.MULTI_POST_DASH_USER_CONFIGS.get(`user:${userSub}:x_oauth2`)
+async function getXOAuth2Token(
+  userSub: string,
+  domain: string,
+  isGroupMode: boolean,
+  env: Bindings,
+): Promise<string | null> {
+  const kvKey = isGroupMode ? `group:${domain}:x_oauth2` : `user:${userSub}:x_oauth2`
+  const appKey = isGroupMode ? `group:${domain}:x_oauth2_app` : `user:${userSub}:x_oauth2_app`
+
+  const raw = await env.MULTI_POST_DASH_USER_CONFIGS.get(kvKey)
   if (!raw) return null
 
   const token = JSON.parse(raw) as {
@@ -130,7 +155,7 @@ async function getXOAuth2Token(userSub: string, env: Bindings): Promise<string |
   }
 
   try {
-    const appRaw = await env.MULTI_POST_DASH_USER_CONFIGS.get(`user:${userSub}:x_oauth2_app`)
+    const appRaw = await env.MULTI_POST_DASH_USER_CONFIGS.get(appKey)
     if (!appRaw) return null
     const { clientId, clientSecret } = JSON.parse(appRaw)
 
@@ -154,7 +179,7 @@ async function getXOAuth2Token(userSub: string, env: Bindings): Promise<string |
       refresh_token: newToken.refresh_token ?? token.refresh_token,
       expires_at: Date.now() + (newToken.expires_in ?? 7200) * 1000,
     }
-    await env.MULTI_POST_DASH_USER_CONFIGS.put(`user:${userSub}:x_oauth2`, JSON.stringify(updated))
+    await env.MULTI_POST_DASH_USER_CONFIGS.put(kvKey, JSON.stringify(updated))
     return updated.access_token
   } catch {
     return null
@@ -167,8 +192,7 @@ async function incrementXPostCount(userSub: string, env: Bindings): Promise<numb
   const key = `user:${userSub}:x_post_count:${yyyymm}`
 
   const raw = await env.MULTI_POST_DASH_USER_CONFIGS.get(key)
-  const current = raw ? parseInt(raw) : 0
-  const next = current + 1
+  const next = (raw ? parseInt(raw) : 0) + 1
   await env.MULTI_POST_DASH_USER_CONFIGS.put(key, String(next))
   return next
 }
@@ -205,7 +229,8 @@ app.get('/', (c) => {
                   class="text-xs font-bold text-slate-500 bg-slate-100 px-2 py-1 rounded-full"
                 ></span>
                 <span
-                  class="text-[10px] text-green-500 font-bold bg-green-50 px-2 py-1 rounded-full"
+                  id="userModeBadge"
+                  class="text-[10px] font-bold bg-green-50 px-2 py-1 rounded-full text-green-500"
                   >✓ Workspace</span
                 >
               </div>
@@ -229,6 +254,10 @@ app.get('/', (c) => {
               🏢 Google Workspace
               アカウントで認証中です。設定を保存するとサーバー側にも自動保存されます。
             </div>
+            <div
+              id="groupNotice"
+              class="hidden p-3 bg-purple-50 border border-purple-200 rounded-2xl text-purple-700 text-xs font-semibold"
+            ></div>
 
             <div class="pb-4 border-b border-slate-200">
               <h3 class="font-bold mb-3 text-slate-700">デフォルトで投稿するプラットフォーム</h3>
@@ -273,6 +302,12 @@ app.get('/', (c) => {
             </div>
 
             <h3 class="font-bold border-b pb-2 mb-2 text-slate-700">API Credentials</h3>
+            <div
+              id="readonlyNotice"
+              class="hidden p-3 bg-amber-50 border border-amber-200 rounded-2xl text-amber-700 text-xs font-semibold mb-2"
+            >
+              🔒 認証情報はグループ管理者のみ変更できます
+            </div>
             <div class="space-y-2">
               <p class="font-semibold text-slate-500">𝕏 (Twitter)</p>
 
@@ -402,7 +437,28 @@ app.get('/', (c) => {
                 placeholder="Access Token"
               />
             </div>
+
+            <div id="adminManageArea" class="hidden mt-4 border-t pt-4 space-y-2">
+              <h3 class="font-bold text-slate-700">グループ管理者</h3>
+              <div id="adminList" class="space-y-1"></div>
+              <div class="flex gap-2 mt-2">
+                <input
+                  type="email"
+                  id="newAdminEmail"
+                  class="flex-1 p-2 border rounded-lg text-xs"
+                  placeholder="追加するメールアドレス"
+                />
+                <button
+                  onclick="addAdmin()"
+                  class="py-2 px-3 text-xs font-bold bg-purple-600 text-white rounded-lg hover:bg-purple-700"
+                >
+                  追加
+                </button>
+              </div>
+            </div>
+
             <button
+              id="saveSettingsBtn"
               onclick="saveSettings()"
               class="w-full bg-slate-900 text-white p-3 rounded-xl font-bold mt-4"
             >
@@ -419,7 +475,7 @@ app.get('/', (c) => {
               >
                 <span class="text-xl">𝕏</span><span class="text-[10px] font-bold">X</span>
               </button>
-              <div id="xPostCountBadge" class="hidden text-center">
+              <div id="xPostCountBadge" class="hidden text-center w-full">
                 <span id="xPostCountText" class="text-[9px] font-bold text-slate-400"></span>
                 <div class="w-full bg-slate-200 rounded-full h-1 mt-0.5">
                   <div
@@ -568,13 +624,164 @@ app.get('/', (c) => {
               const data = await res.json()
               if (data.email) {
                 currentUser = data
-                showUserBadge(data.email)
-                await loadUserConfig()
+                showUserBadge(data)
+                await loadConfig()
                 await checkXOAuth2Status()
                 await fetchXPostCount()
+                if (data.isGroupMode) await loadAdminUI()
               }
             } catch (e) {
               loadDefaultsFromLocalStorage()
+            }
+          }
+
+          function showUserBadge(user) {
+            document.getElementById('userBadge').classList.remove('hidden')
+            document.getElementById('userBadge').classList.add('flex')
+            document.getElementById('userEmail').innerText = user.email
+            const badge = document.getElementById('userModeBadge')
+            if (user.isGroupMode) {
+              badge.textContent = \`✓ \${user.domain}\`
+              badge.className =
+                'text-[10px] font-bold bg-purple-50 px-2 py-1 rounded-full text-purple-500'
+              document.getElementById('workspaceNotice').classList.add('hidden')
+              const groupNotice = document.getElementById('groupNotice')
+              groupNotice.classList.remove('hidden')
+              groupNotice.textContent = \`🏢 グループモード: \${user.domain} の設定を共有しています\`
+            } else {
+              badge.textContent = '✓ Workspace'
+              badge.className =
+                'text-[10px] font-bold bg-green-50 px-2 py-1 rounded-full text-green-500'
+              document.getElementById('workspaceNotice').classList.remove('hidden')
+            }
+          }
+
+          async function loadConfig() {
+            try {
+              const endpoint = currentUser.isGroupMode ? '/api/group-config' : '/api/user-config'
+              const res = await fetch(endpoint)
+              if (!res.ok) {
+                loadDefaultsFromLocalStorage()
+                return
+              }
+              const config = await res.json()
+              if (!config) {
+                loadDefaultsFromLocalStorage()
+                return
+              }
+
+              const fields = [
+                'xKey',
+                'xSecret',
+                'xToken',
+                'xTokenSecret',
+                'bskyHandle',
+                'bskyPass',
+                'threadsUserId',
+                'threadsToken',
+                'mastoInstance',
+                'mastoToken',
+              ]
+              fields.forEach((f) => {
+                const el = document.getElementById(f)
+                if (el && config[f]) el.value = config[f]
+              })
+              const defaultPlatforms =
+                config.defaultPlatforms ??
+                JSON.parse(localStorage.getItem('post_dash_v3') || '{}').defaultPlatforms ??
+                []
+              applyPlatformDefaults(defaultPlatforms)
+
+              if (currentUser.isGroupMode && !currentUser.isAdmin) {
+                setCredentialsReadonly(true)
+              }
+            } catch (e) {
+              console.error('Config load error:', e)
+              loadDefaultsFromLocalStorage()
+            }
+          }
+
+          function setCredentialsReadonly(readonly) {
+            const fields = [
+              'xKey',
+              'xSecret',
+              'xToken',
+              'xTokenSecret',
+              'bskyHandle',
+              'bskyPass',
+              'threadsUserId',
+              'threadsToken',
+              'mastoInstance',
+              'mastoToken',
+              'xClientId',
+              'xClientSecret',
+            ]
+            fields.forEach((f) => {
+              const el = document.getElementById(f)
+              if (el) el.readOnly = readonly
+            })
+            document.getElementById('readonlyNotice').classList.toggle('hidden', !readonly)
+            document.getElementById('saveSettingsBtn').disabled = readonly
+            if (readonly) {
+              document.getElementById('xOAuth2ConnectBtn')?.classList.add('hidden')
+              document.getElementById('xOAuth2DisconnectBtn')?.classList.add('hidden')
+            }
+          }
+
+          async function loadAdminUI() {
+            try {
+              const res = await fetch('/api/group-admins')
+              if (!res.ok) return
+              const { admins, isAdmin } = await res.json()
+              currentUser.isAdmin = isAdmin
+
+              if (isAdmin) {
+                document.getElementById('adminManageArea').classList.remove('hidden')
+                renderAdminList(admins)
+              }
+            } catch (e) {}
+          }
+
+          function renderAdminList(admins) {
+            const container = document.getElementById('adminList')
+            container.innerHTML = admins
+              .map(
+                (email) =>
+                  \`<div class="flex justify-between items-center p-2 bg-white rounded-lg border border-slate-100 text-xs">
+                <span class="text-slate-600">\${email}</span>
+                <button onclick="removeAdmin('\${email}')" class="text-red-400 hover:text-red-600 font-bold">削除</button>
+              </div>\`,
+              )
+              .join('')
+          }
+
+          async function addAdmin() {
+            const email = document.getElementById('newAdminEmail').value.trim()
+            if (!email) return
+            try {
+              const res = await fetch('/api/group-admins', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email }),
+              })
+              if (res.ok) {
+                document.getElementById('newAdminEmail').value = ''
+                await loadAdminUI()
+              } else {
+                alert('追加に失敗しました')
+              }
+            } catch (e) {
+              alert('エラーが発生しました')
+            }
+          }
+
+          async function removeAdmin(email) {
+            if (!confirm(\`\${email} を管理者から削除しますか？\`)) return
+            try {
+              await fetch(\`/api/group-admins/\${encodeURIComponent(email)}\`, { method: 'DELETE' })
+              await loadAdminUI()
+            } catch (e) {
+              alert('削除に失敗しました')
             }
           }
 
@@ -583,7 +790,7 @@ app.get('/', (c) => {
             try {
               const res = await fetch('/api/x-post-count')
               if (!res.ok) return
-              const { count, limit, yearMonth } = await res.json()
+              const { count, limit } = await res.json()
               const badge = document.getElementById('xPostCountBadge')
               const text = document.getElementById('xPostCountText')
               const bar = document.getElementById('xPostCountBar')
@@ -643,13 +850,6 @@ app.get('/', (c) => {
             } else {
               btn.disabled = false
             }
-          }
-
-          function showUserBadge(email) {
-            document.getElementById('userBadge').classList.remove('hidden')
-            document.getElementById('userBadge').classList.add('flex')
-            document.getElementById('userEmail').innerText = email
-            document.getElementById('workspaceNotice').classList.remove('hidden')
           }
 
           async function checkXOAuth2Status() {
@@ -717,47 +917,6 @@ app.get('/', (c) => {
             }
           }
 
-          async function loadUserConfig() {
-            try {
-              const res = await fetch('/api/user-config')
-              if (!res.ok) {
-                loadDefaultsFromLocalStorage()
-                return
-              }
-              const config = await res.json()
-              if (!config) {
-                loadDefaultsFromLocalStorage()
-                return
-              }
-
-              const fields = [
-                'xKey',
-                'xSecret',
-                'xToken',
-                'xTokenSecret',
-                'bskyHandle',
-                'bskyPass',
-                'threadsUserId',
-                'threadsToken',
-                'mastoInstance',
-                'mastoToken',
-              ]
-              fields.forEach((f) => {
-                const el = document.getElementById(f)
-                if (el && config[f]) el.value = config[f]
-              })
-
-              const defaultPlatforms =
-                config.defaultPlatforms ??
-                JSON.parse(localStorage.getItem('post_dash_v3') || '{}').defaultPlatforms ??
-                []
-              applyPlatformDefaults(defaultPlatforms)
-            } catch (e) {
-              console.error('Config load error:', e)
-              loadDefaultsFromLocalStorage()
-            }
-          }
-
           async function saveSettings() {
             const defaultPlatforms = ['x', 'bsky', 'threads', 'mastodon'].filter(
               (p) => document.getElementById('default-' + p).checked,
@@ -782,15 +941,18 @@ app.get('/', (c) => {
             applyPlatformDefaults(defaultPlatforms)
 
             if (currentUser) {
+              const endpoint = currentUser.isGroupMode ? '/api/group-config' : '/api/user-config'
               try {
-                const res = await fetch('/api/user-config', {
+                const res = await fetch(endpoint, {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify(config),
                 })
                 alert(
                   res.ok
-                    ? 'Workspace アカウントに保存しました！'
+                    ? currentUser.isGroupMode
+                      ? \`\${currentUser.domain} グループに保存しました！\`
+                      : 'Workspace アカウントに保存しました！'
                     : 'LocalStorage に保存しました（サーバー保存に失敗）',
                 )
               } catch (e) {
@@ -999,7 +1161,17 @@ app.get('/', (c) => {
 app.get('/api/me', async (c) => {
   const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
   if (!user) return c.json({ error: 'Not authenticated via Cloudflare Access' }, 401)
-  return c.json({ email: user.email, sub: user.sub })
+  let isAdmin = false
+  if (user.isGroupMode) {
+    isAdmin = await isGroupAdmin(user.email, user.domain, c.env)
+  }
+  return c.json({
+    email: user.email,
+    sub: user.sub,
+    domain: user.domain,
+    isGroupMode: user.isGroupMode,
+    isAdmin,
+  })
 })
 
 app.get('/api/user-config', async (c) => {
@@ -1015,6 +1187,69 @@ app.post('/api/user-config', async (c) => {
   if (!user) return c.json({ error: 'Unauthorized' }, 401)
   const config = await c.req.json()
   await c.env.MULTI_POST_DASH_USER_CONFIGS.put(`user:${user.sub}:config`, JSON.stringify(config))
+  return c.json({ success: true })
+})
+
+app.get('/api/group-config', async (c) => {
+  const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
+  if (!user || !user.isGroupMode) return c.json({ error: 'Unauthorized' }, 401)
+  const raw = await c.env.MULTI_POST_DASH_USER_CONFIGS.get(`group:${user.domain}:config`)
+  if (!raw) return c.json(null)
+  return c.json(JSON.parse(raw))
+})
+
+app.post('/api/group-config', async (c) => {
+  const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
+  if (!user || !user.isGroupMode) return c.json({ error: 'Unauthorized' }, 401)
+  const admin = await isGroupAdmin(user.email, user.domain, c.env)
+  if (!admin) return c.json({ error: 'Forbidden: admin only' }, 403)
+  const config = await c.req.json()
+  await c.env.MULTI_POST_DASH_USER_CONFIGS.put(
+    `group:${user.domain}:config`,
+    JSON.stringify(config),
+  )
+  return c.json({ success: true })
+})
+
+app.get('/api/group-admins', async (c) => {
+  const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
+  if (!user || !user.isGroupMode) return c.json({ error: 'Unauthorized' }, 401)
+  const admins = await getGroupAdmins(user.domain, c.env)
+  const isAdmin = admins.includes(user.email)
+  return c.json({ admins, isAdmin })
+})
+
+app.post('/api/group-admins', async (c) => {
+  const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
+  if (!user || !user.isGroupMode) return c.json({ error: 'Unauthorized' }, 401)
+  const admin = await isGroupAdmin(user.email, user.domain, c.env)
+  if (!admin) return c.json({ error: 'Forbidden: admin only' }, 403)
+  const { email } = await c.req.json()
+  if (!email.endsWith(`@${user.domain}`)) return c.json({ error: `Must be @${user.domain}` }, 400)
+  const admins = await getGroupAdmins(user.domain, c.env)
+  if (!admins.includes(email)) {
+    admins.push(email)
+    await c.env.MULTI_POST_DASH_USER_CONFIGS.put(
+      `group:${user.domain}:admins`,
+      JSON.stringify(admins),
+    )
+  }
+  return c.json({ success: true })
+})
+
+app.delete('/api/group-admins/:email', async (c) => {
+  const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
+  if (!user || !user.isGroupMode) return c.json({ error: 'Unauthorized' }, 401)
+  const admin = await isGroupAdmin(user.email, user.domain, c.env)
+  if (!admin) return c.json({ error: 'Forbidden: admin only' }, 403)
+  const targetEmail = decodeURIComponent(c.req.param('email'))
+  const admins = await getGroupAdmins(user.domain, c.env)
+  if (admins.length <= 1) return c.json({ error: '最後の管理者は削除できません' }, 400)
+  const updated = admins.filter((e: string) => e !== targetEmail)
+  await c.env.MULTI_POST_DASH_USER_CONFIGS.put(
+    `group:${user.domain}:admins`,
+    JSON.stringify(updated),
+  )
   return c.json({ success: true })
 })
 
@@ -1042,7 +1277,14 @@ async function executePost(data: any) {
 
       // OAuth 2.0 トークンが KV にあれば優先、なければ 1.0a にフォールバック
       const oauth2Token =
-        data.userSub && data.env ? await getXOAuth2Token(data.userSub, data.env) : null
+        data.userSub && data.env
+          ? await getXOAuth2Token(
+              data.userSub,
+              data.domain ?? '',
+              data.isGroupMode ?? false,
+              data.env,
+            )
+          : null
 
       if (oauth2Token) {
         // --- OAuth 2.0 Bearer ---
@@ -1102,9 +1344,12 @@ async function executePost(data: any) {
       } else {
         const errText = await xRes.text()
         console.error(`X API error [${xRes.status}]:`, errText)
-        const err = (await xRes.json()) as any
-
-        // results.x = `error: ${err.detail || err.title}`
+        try {
+          const err = JSON.parse(errText) as any
+          results.x = `error: ${err.detail || err.title || err.errors?.[0]?.message || xRes.status}`
+        } catch {
+          results.x = `error: ${xRes.status} ${errText.slice(0, 100)}`
+        }
       }
     } catch (e: any) {
       results.x = `error: ${e.message}`
@@ -1235,11 +1480,21 @@ app.get('/auth/x/login', async (c) => {
   const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
   if (!user) return c.json({ error: 'Unauthorized' }, 401)
 
-  const appRaw = await c.env.MULTI_POST_DASH_USER_CONFIGS.get(`user:${user.sub}:x_oauth2_app`)
-  if (!appRaw)
+  if (user.isGroupMode) {
+    const admin = await isGroupAdmin(user.email, user.domain, c.env)
+    if (!admin) return c.json({ error: 'Forbidden: admin only' }, 403)
+  }
+
+  const appKey = user.isGroupMode
+    ? `group:${user.domain}:x_oauth2_app`
+    : `user:${user.sub}:x_oauth2_app`
+  const appRaw = await c.env.MULTI_POST_DASH_USER_CONFIGS.get(appKey)
+  if (!appRaw) {
     return c.html(
-      '<p>X の Client ID が設定されていません。設定画面から入力してください。<a href="/">戻る</a></p>',
+      '<p>X の Client ID が設定されていません。<a href="/">戻る</a></p>',
     )
+  }
+
   const { clientId } = JSON.parse(appRaw)
 
   const codeVerifier = await generateCodeVerifier()
@@ -1250,7 +1505,13 @@ app.get('/auth/x/login', async (c) => {
 
   await c.env.MULTI_POST_DASH_USER_CONFIGS.put(
     `pkce:${state}`,
-    JSON.stringify({ codeVerifier, userSub: user.sub, callbackUrl }),
+    JSON.stringify({
+      codeVerifier,
+      userSub: user.sub,
+      domain: user.domain,
+      isGroupMode: user.isGroupMode,
+      callbackUrl,
+    }),
     { expirationTtl: 600 },
   )
 
@@ -1279,10 +1540,11 @@ app.get('/auth/x/callback', async (c) => {
   const pkceRaw = await c.env.MULTI_POST_DASH_USER_CONFIGS.get(`pkce:${state}`)
   if (!pkceRaw) return c.html('<p>セッションが期限切れです。<a href="/">戻る</a></p>')
 
-  const { codeVerifier, userSub, callbackUrl } = JSON.parse(pkceRaw)
+  const { codeVerifier, userSub, domain, isGroupMode, callbackUrl } = JSON.parse(pkceRaw)
   await c.env.MULTI_POST_DASH_USER_CONFIGS.delete(`pkce:${state}`)
 
-  const appRaw = await c.env.MULTI_POST_DASH_USER_CONFIGS.get(`user:${userSub}:x_oauth2_app`)
+  const appKey = isGroupMode ? `group:${domain}:x_oauth2_app` : `user:${userSub}:x_oauth2_app`
+  const appRaw = await c.env.MULTI_POST_DASH_USER_CONFIGS.get(appKey)
   if (!appRaw) return c.html('<p>アプリ設定が見つかりません。<a href="/">戻る</a></p>')
   const { clientId, clientSecret } = JSON.parse(appRaw)
 
@@ -1311,8 +1573,9 @@ app.get('/auth/x/callback', async (c) => {
     refresh_token: tokenData.refresh_token,
     expires_at: Date.now() + (tokenData.expires_in ?? 7200) * 1000,
   }
+  const tokenKey = isGroupMode ? `group:${domain}:x_oauth2` : `user:${userSub}:x_oauth2`
 
-  await c.env.MULTI_POST_DASH_USER_CONFIGS.put(`user:${userSub}:x_oauth2`, JSON.stringify(stored))
+  await c.env.MULTI_POST_DASH_USER_CONFIGS.put(tokenKey, JSON.stringify(stored))
 
   return c.html(`
     <html><head><meta http-equiv="refresh" content="0;url=/" /></head>
@@ -1323,14 +1586,18 @@ app.get('/auth/x/callback', async (c) => {
 app.get('/auth/x/status', async (c) => {
   const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
   if (!user) return c.json({ error: 'Unauthorized' }, 401)
-  const raw = await c.env.MULTI_POST_DASH_USER_CONFIGS.get(`user:${user.sub}:x_oauth2`)
+  const kvKey = user.isGroupMode ? `group:${user.domain}:x_oauth2` : `user:${user.sub}:x_oauth2`
+  const raw = await c.env.MULTI_POST_DASH_USER_CONFIGS.get(kvKey)
   return c.json({ connected: !!raw })
 })
 
 app.get('/auth/x/app-config', async (c) => {
   const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
   if (!user) return c.json({ error: 'Unauthorized' }, 401)
-  const raw = await c.env.MULTI_POST_DASH_USER_CONFIGS.get(`user:${user.sub}:x_oauth2_app`)
+  const kvKey = user.isGroupMode
+    ? `group:${user.domain}:x_oauth2_app`
+    : `user:${user.sub}:x_oauth2_app`
+  const raw = await c.env.MULTI_POST_DASH_USER_CONFIGS.get(kvKey)
   if (!raw) return c.json({ clientId: null, clientSecret: null })
   return c.json(JSON.parse(raw))
 })
@@ -1338,25 +1605,40 @@ app.get('/auth/x/app-config', async (c) => {
 app.post('/auth/x/app-config', async (c) => {
   const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
   if (!user) return c.json({ error: 'Unauthorized' }, 401)
+  if (user.isGroupMode) {
+    const admin = await isGroupAdmin(user.email, user.domain, c.env)
+    if (!admin) return c.json({ error: 'Forbidden: admin only' }, 403)
+  }
   const { clientId, clientSecret } = await c.req.json()
-  await c.env.MULTI_POST_DASH_USER_CONFIGS.put(
-    `user:${user.sub}:x_oauth2_app`,
-    JSON.stringify({ clientId, clientSecret }),
-  )
+  const kvKey = user.isGroupMode
+    ? `group:${user.domain}:x_oauth2_app`
+    : `user:${user.sub}:x_oauth2_app`
+  await c.env.MULTI_POST_DASH_USER_CONFIGS.put(kvKey, JSON.stringify({ clientId, clientSecret }))
   return c.json({ success: true })
 })
 
 app.delete('/auth/x/token', async (c) => {
   const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
   if (!user) return c.json({ error: 'Unauthorized' }, 401)
-  await c.env.MULTI_POST_DASH_USER_CONFIGS.delete(`user:${user.sub}:x_oauth2`)
+  if (user.isGroupMode) {
+    const admin = await isGroupAdmin(user.email, user.domain, c.env)
+    if (!admin) return c.json({ error: 'Forbidden: admin only' }, 403)
+  }
+  const kvKey = user.isGroupMode ? `group:${user.domain}:x_oauth2` : `user:${user.sub}:x_oauth2`
+  await c.env.MULTI_POST_DASH_USER_CONFIGS.delete(kvKey)
   return c.json({ success: true })
 })
 
 app.post('/api/post', async (c) => {
   const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
   const data = await c.req.json()
-  const results = await executePost({ ...data, userSub: user?.sub ?? null, env: c.env })
+  const results = await executePost({
+    ...data,
+    userSub: user?.sub ?? null,
+    domain: user?.domain ?? '',
+    isGroupMode: user?.isGroupMode ?? false,
+    env: c.env,
+  })
   return c.json(results)
 })
 
@@ -1365,24 +1647,28 @@ app.post('/api/schedule', async (c) => {
   if (!user) return c.json({ error: 'Unauthorized' }, 401)
   const { text, platforms, scheduledAt } = await c.req.json()
   const id = crypto.randomUUID()
+  const ts = new Date(scheduledAt).getTime()
   const payload = {
     id,
     text,
     platforms,
     userSub: user.sub,
-    scheduledAt: new Date(scheduledAt).getTime(),
+    domain: user.domain,
+    isGroupMode: user.isGroupMode,
+    scheduledAt: ts,
   }
-  await c.env.POST_QUEUE.put(
-    `queue:${user.sub}:${payload.scheduledAt}:${id}`,
-    JSON.stringify(payload),
-  )
+  const queueKey = user.isGroupMode
+    ? `queue:group:${user.domain}:${ts}:${id}`
+    : `queue:user:${user.sub}:${ts}:${id}`
+  await c.env.POST_QUEUE.put(queueKey, JSON.stringify(payload))
   return c.json({ success: true })
 })
 
 app.get('/api/queue', async (c) => {
   const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
   if (!user) return c.json({ error: 'Unauthorized' }, 401)
-  const list = await c.env.POST_QUEUE.list({ prefix: `queue:${user.sub}:` })
+  const prefix = user.isGroupMode ? `queue:group:${user.domain}:` : `queue:user:${user.sub}:`
+  const list = await c.env.POST_QUEUE.list({ prefix })
   const items = await Promise.all(
     list.keys.map(async (k: { name: string }) =>
       JSON.parse((await c.env.POST_QUEUE.get(k.name)) || 'null'),
@@ -1401,7 +1687,8 @@ app.delete('/api/queue/:id', async (c) => {
   const user = await getUser(c.req.raw, c.env.CF_TEAM_DOMAIN)
   if (!user) return c.json({ error: 'Unauthorized' }, 401)
   const id = c.req.param('id')
-  const list = await c.env.POST_QUEUE.list({ prefix: `queue:${user.sub}:` })
+  const prefix = user.isGroupMode ? `queue:group:${user.domain}:` : `queue:user:${user.sub}:`
+  const list = await c.env.POST_QUEUE.list({ prefix })
   const target = list.keys.find((k: { name: string }) => k.name.endsWith(id))
   if (target) await c.env.POST_QUEUE.delete(target.name)
   return c.json({ success: !!target })
@@ -1418,16 +1705,17 @@ export default {
     const now = Date.now()
     const list = await env.POST_QUEUE.list({ prefix: 'queue:' })
     for (const key of list.keys) {
-      const timestamp = parseInt(key.name.split(':')[2])
+      const timestamp = parseInt(key.name.split(':')[3])
       if (timestamp <= now) {
         const val = await env.POST_QUEUE.get(key.name)
         if (val) {
           const payload = JSON.parse(val)
-          const configRaw = await env.MULTI_POST_DASH_USER_CONFIGS.get(
-            `user:${payload.userSub}:config`,
-          )
+          const configKey = payload.isGroupMode
+            ? `group:${payload.domain}:config`
+            : `user:${payload.userSub}:config`
+          const configRaw = await env.MULTI_POST_DASH_USER_CONFIGS.get(configKey)
           if (!configRaw) {
-            console.error('Config not found')
+            console.error('Config not found:', configKey)
             continue
           }
           await executePost({
@@ -1435,6 +1723,8 @@ export default {
             platforms: payload.platforms,
             config: JSON.parse(configRaw),
             userSub: payload.userSub,
+            domain: payload.domain ?? '',
+            isGroupMode: payload.isGroupMode ?? false,
             env,
           })
           await env.POST_QUEUE.delete(key.name)
